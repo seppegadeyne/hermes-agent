@@ -860,16 +860,25 @@ class TestMaxIterationsSummaryReplay:
 
         captured = {}
 
-        class _Completions:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return "RAW-RESPONSE"
+        def _build_kwargs(**kwargs):
+            return {
+                "model": kwargs["model"],
+                "messages": kwargs["messages"],
+                "tools": kwargs["tools"],
+            }
 
-        client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=_Completions())
-        )
+        def _call(kwargs):
+            captured.update(kwargs)
+            return "RAW-RESPONSE"
+
         transport = types.SimpleNamespace(
-            normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
+            build_kwargs=_build_kwargs,
+            normalize_response=lambda _r: types.SimpleNamespace(
+                content="SUMMARY",
+                tool_calls=None,
+                reasoning=None,
+                finish_reason="stop",
+            ),
         )
 
         messages = [
@@ -877,7 +886,7 @@ class TestMaxIterationsSummaryReplay:
             {"role": "assistant", "content": "a1"},
         ]
         with patch.object(
-            agent, "_ensure_primary_openai_client", return_value=client
+            agent, "_interruptible_api_call", side_effect=_call
         ), patch.object(agent, "_get_transport", return_value=transport):
             out = handle_max_iterations(agent, messages, 5)
 

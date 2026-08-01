@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_guardrails import TERMINAL_LOOP_CAP_CODES
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -212,6 +213,30 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _append_terminal_cap_skips(agent, tool_calls, messages: list) -> bool:
+    """Close unstarted tool calls after a terminal cap without side effects."""
+    for skipped_tc in tool_calls:
+        skipped_name = skipped_tc.function.name
+        messages.append(
+            make_tool_result_message(
+                skipped_name,
+                (
+                    f"[Tool execution skipped — {skipped_name} was not started "
+                    "because a terminal tool-loop cap was reached]"
+                ),
+                skipped_tc.id,
+                effect_disposition="none",
+            )
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"terminal-cap skipped tool result {skipped_name}",
+        ):
+            return False
+    return True
 
 
 def _emit_cancelled_terminal_post_tool_call(
@@ -1951,6 +1976,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        _halt = getattr(agent, "_tool_guardrail_halt_decision", None)
+        if (
+            _halt is not None
+            and _halt.code in TERMINAL_LOOP_CAP_CODES
+            and i < len(assistant_message.tool_calls)
+        ):
+            if not _append_terminal_cap_skips(
+                agent,
+                assistant_message.tool_calls[i:],
+                messages,
+            ):
+                return
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2016,6 +2055,17 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+
+    _guardrails = getattr(agent, "_tool_guardrails", None)
+    _batch_cap_check = getattr(_guardrails, "batch_would_hit_loop_cap", None)
+    if (
+        callable(_batch_cap_check)
+        and _batch_cap_check(assistant_message.tool_calls)
+    ):
+        # Reserve cap checks in emission order. A concurrent batch could let a
+        # later mutating call start before an earlier capped search/delegation
+        # call records the terminal halt.
+        segments = [("sequential", list(assistant_message.tool_calls))]
 
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):

@@ -192,6 +192,7 @@ from agent.codex_responses_adapter import (
     _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
 from agent.tool_guardrails import (
+    TERMINAL_LOOP_CAP_CODES,
     ToolGuardrailDecision,
     append_toolguard_guidance,
     toolguard_synthetic_result,
@@ -6960,6 +6961,40 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _toolguard_final_response(
+        self,
+        messages: list,
+        decision: ToolGuardrailDecision,
+        api_call_count: int,
+    ):
+        """Return a useful final answer for terminal research/delegation caps."""
+        from agent.chat_completion_helpers import (
+            FinalSummaryResult,
+            handle_terminal_cap_summary,
+        )
+
+        fallback = self._toolguard_controlled_halt_response(decision)
+        if decision.code not in TERMINAL_LOOP_CAP_CODES:
+            return FinalSummaryResult(fallback, 0, False)
+
+        return handle_terminal_cap_summary(
+            self,
+            messages,
+            api_call_count,
+            summary_request=(
+                "The tool-call guardrail stopped further research because this turn "
+                f"reached {decision.code}. Do not call any more tools. Answer the "
+                "user's original request now using the evidence already present in "
+                "the conversation. Clearly state any important limitations caused "
+                "by the cap instead of returning only a guardrail error."
+            ),
+            failure_response=fallback,
+            status_message=(
+                f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}. "
+                "Requesting a final answer from existing results..."
+            ),
+        )
+
     def _append_guardrail_observation(
         self,
         tool_name: str,
@@ -7003,6 +7038,19 @@ class AIAgent:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
+                )
+
+            _batch_cap_check = getattr(
+                self._tool_guardrails,
+                "batch_would_hit_loop_cap",
+                None,
+            )
+            if callable(_batch_cap_check) and _batch_cap_check(tool_calls):
+                return self._execute_tool_calls_sequential(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
@@ -7116,10 +7164,17 @@ class AIAgent:
         from agent.tool_executor import execute_tool_calls_sequential
         return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
+    def _handle_max_iterations(
+        self,
+        messages: list,
+        api_call_count: int,
+    ) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
-        from agent.chat_completion_helpers import handle_max_iterations
-        return handle_max_iterations(self, messages, api_call_count)
+        from agent.chat_completion_helpers import handle_max_iterations_result
+
+        result = handle_max_iterations_result(self, messages, api_call_count)
+        self._last_max_iteration_summary_result = result
+        return result.text
 
     def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.

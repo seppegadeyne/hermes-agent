@@ -1,6 +1,7 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+from types import SimpleNamespace
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -167,6 +168,31 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
+
+
+def test_batch_cap_preflight_counts_every_subagent_in_delegate_batch():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(max_subagents=2),
+        )
+    )
+    assert controller.before_call("delegate_task", {"goal": "first"}).action == "allow"
+    batched_call = SimpleNamespace(
+        function=SimpleNamespace(
+            name="delegate_task",
+            arguments=json.dumps(
+                {
+                    "tasks": [
+                        {"goal": "second"},
+                        {"goal": "third"},
+                    ]
+                }
+            ),
+        )
+    )
+
+    assert controller.batch_would_hit_loop_cap([batched_call]) is True
 
 
 

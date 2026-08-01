@@ -138,7 +138,21 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        agent._last_max_iteration_summary_result = None
+        final_response = agent._handle_max_iterations(
+            messages,
+            api_call_count,
+        )
+        _iteration_summary = getattr(
+            agent,
+            "_last_max_iteration_summary_result",
+            None,
+        )
+        if (
+            _iteration_summary is not None
+            and _iteration_summary.text == final_response
+        ):
+            api_call_count += _iteration_summary.api_attempts
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:

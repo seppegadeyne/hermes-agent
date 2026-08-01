@@ -6216,11 +6216,22 @@ def run_conversation(
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
-                    final_response = agent._toolguard_controlled_halt_response(decision)
+                    _guardrail_final = agent._toolguard_final_response(
+                        messages,
+                        decision,
+                        api_call_count,
+                    )
+                    final_response = _guardrail_final.text
+                    api_call_count += _guardrail_final.api_attempts
                     agent._emit_status(
                         f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
                     )
-                    messages.append({"role": "assistant", "content": final_response})
+                    if not (
+                        messages
+                        and messages[-1].get("role") == "assistant"
+                        and messages[-1].get("content") == final_response
+                    ):
+                        messages.append({"role": "assistant", "content": final_response})
                     # Emit the halt message to the client so it's not
                     # indistinguishable from a crash.  The stream display
                     # was flushed (callback(None)) before tool execution,
@@ -6229,8 +6240,17 @@ def run_conversation(
                     if final_response:
                         agent._safe_print(f"\n{final_response}\n")
                         if agent.stream_delta_callback:
+                            if _guardrail_final.already_streamed:
+                                agent._response_was_previewed = True
+                            else:
+                                try:
+                                    agent.stream_delta_callback(final_response)
+                                except Exception:
+                                    logger.debug(
+                                        "stream_delta_callback failed for guardrail halt",
+                                        exc_info=True,
+                                    )
                             try:
-                                agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass

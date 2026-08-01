@@ -134,6 +134,9 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+TERMINAL_LOOP_CAP_CODES = frozenset(
+    {"loop_web_search_cap", "loop_subagent_cap"}
+)
 
 
 @dataclass(frozen=True)
@@ -291,6 +294,31 @@ class ToolCallGuardrailController:
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    def batch_would_hit_loop_cap(self, tool_calls: list[Any]) -> bool:
+        """Return whether this batch can cross a terminal per-turn loop cap."""
+        web_searches = 0
+        subagents = 0
+        for call in tool_calls:
+            if isinstance(call, str):
+                name = call
+                args = {}
+            else:
+                function = getattr(call, "function", None)
+                name = str(getattr(function, "name", "") or "")
+                raw_args = getattr(function, "arguments", {})
+                parsed_args = safe_json_loads(raw_args) if isinstance(raw_args, str) else raw_args
+                args = parsed_args if isinstance(parsed_args, Mapping) else {}
+            if name == "web_search":
+                web_searches += 1
+            elif name == "delegate_task":
+                subagents += _subagent_spawn_count(args)
+        web_cap = self.config.loop_caps.max_web_searches
+        subagent_cap = self.config.loop_caps.max_subagents
+        return bool(
+            (web_cap and self._turn_web_search_count + web_searches > web_cap)
+            or (subagent_cap and self._turn_subagent_count + subagents > subagent_cap)
+        )
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
@@ -485,15 +513,16 @@ class ToolCallGuardrailController:
             if not cap:
                 return None
             spawn_count = _subagent_spawn_count(args)
-            if self._turn_subagent_count >= cap:
+            if self._turn_subagent_count + spawn_count > cap:
                 decision = ToolGuardrailDecision(
                     action="block",
                     code="loop_subagent_cap",
                     message=(
-                        f"Blocked delegate_task: this turn has already spawned "
-                        f"{self._turn_subagent_count} subagents (limit {cap}). "
-                        "This looks like a runaway delegation loop. Finish the "
-                        "work with the results you have and answer the user."
+                        f"Blocked delegate_task: spawning {spawn_count} more subagent(s) "
+                        f"after {self._turn_subagent_count} already spawned would exceed "
+                        f"the per-turn limit of {cap}. "
+                        "This looks like a runaway delegation loop. Work with the "
+                        "subagent results you already have and give the user your answer."
                     ),
                     tool_name=tool_name,
                     count=self._turn_subagent_count,

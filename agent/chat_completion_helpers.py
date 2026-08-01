@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -2068,14 +2068,135 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+def _record_final_summary_usage(agent, response) -> None:
+    """Account for a forced final-response request like a normal model call."""
+    agent.session_api_calls += 1
+    raw_usage = getattr(response, "usage", None)
+    canonical_usage = None
+    cost_result = None
+    if raw_usage:
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
-    summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
+        canonical_usage = normalize_usage(
+            raw_usage,
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+        )
+        agent.session_prompt_tokens += canonical_usage.prompt_tokens
+        agent.session_completion_tokens += canonical_usage.output_tokens
+        agent.session_total_tokens += canonical_usage.total_tokens
+        agent.session_input_tokens += canonical_usage.input_tokens
+        agent.session_output_tokens += canonical_usage.output_tokens
+        agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
+        agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
+        agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+        usage_dict = {
+            "prompt_tokens": canonical_usage.prompt_tokens,
+            "completion_tokens": canonical_usage.output_tokens,
+            "total_tokens": canonical_usage.total_tokens,
+            "input_tokens": canonical_usage.input_tokens,
+            "output_tokens": canonical_usage.output_tokens,
+            "cache_read_tokens": canonical_usage.cache_read_tokens,
+            "cache_write_tokens": canonical_usage.cache_write_tokens,
+            "reasoning_tokens": canonical_usage.reasoning_tokens,
+        }
+        agent._last_turn_usage = dict(usage_dict)
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None:
+            try:
+                compressor.update_from_response(usage_dict)
+            except Exception:
+                logger.debug("final-summary usage update failed", exc_info=True)
+        cost_result = estimate_usage_cost(
+            agent.model,
+            canonical_usage,
+            provider=agent.provider,
+            base_url=agent.base_url,
+            api_key=getattr(agent, "api_key", ""),
+        )
+        if cost_result.amount_usd is not None:
+            agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+        agent.session_cost_status = cost_result.status
+        agent.session_cost_source = cost_result.source
+
+    if agent._session_db and agent.session_id:
+        try:
+            if not agent._session_db_created:
+                agent._ensure_db_session()
+            agent._session_db.queue_token_counts(
+                agent.session_id,
+                input_tokens=(canonical_usage.input_tokens if canonical_usage else 0),
+                output_tokens=(canonical_usage.output_tokens if canonical_usage else 0),
+                cache_read_tokens=(
+                    canonical_usage.cache_read_tokens if canonical_usage else 0
+                ),
+                cache_write_tokens=(
+                    canonical_usage.cache_write_tokens if canonical_usage else 0
+                ),
+                reasoning_tokens=(
+                    canonical_usage.reasoning_tokens if canonical_usage else 0
+                ),
+                estimated_cost_usd=(
+                    float(cost_result.amount_usd)
+                    if cost_result and cost_result.amount_usd is not None
+                    else None
+                ),
+                cost_status=cost_result.status if cost_result else None,
+                cost_source=cost_result.source if cost_result else None,
+                billing_provider=agent.provider,
+                billing_base_url=agent.base_url,
+                billing_mode=(
+                    "subscription_included"
+                    if cost_result and cost_result.status == "included"
+                    else None
+                ),
+                model=agent.model,
+                api_call_count=1,
+            )
+        except Exception:
+            logger.debug("final-summary token persistence failed", exc_info=True)
+
+
+class FinalSummaryResult(NamedTuple):
+    """Outcome metadata for a tool-free final-response request."""
+
+    text: str
+    api_attempts: int
+    already_streamed: bool
+
+
+def _request_final_summary(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    summary_request: str | None = None,
+    failure_response: str | None = None,
+    call_role: str = "iteration_summary",
+    request_id_prefix: str = "iteration-summary",
+    status_message: str | None = None,
+    retry_empty: bool = True,
+    persist_summary_request: bool = True,
+) -> FinalSummaryResult:
+    """Request one tool-free final response after a terminal loop condition."""
+    print(
+        status_message
+        or f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    )
+
+    custom_failure_response = failure_response is not None
+    failure_response = failure_response or (
+        "I reached the iteration limit and couldn't generate a summary."
+    )
+
+    summary_api_request_id = f"{request_id_prefix}:{uuid.uuid4()}"
     summary_call_outcome = "failed"
+    summary_api_attempts = 0
+
 
     def _managed_summary_call(request, callback, *, retry_count: int):
+        nonlocal summary_api_attempts
+        summary_api_attempts += 1
         from agent import relay_llm
 
         return relay_llm.execute_current(
@@ -2088,25 +2209,30 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     getattr(agent, "api_mode", "") or "chat_completions"
                 ),
                 "api_request_id": summary_api_request_id,
-                "call_role": "iteration_summary",
+                "call_role": call_role,
                 "retry_count": retry_count,
             },
             defer_logical_completion=True,
         )
 
-    summary_request = (
+    summary_request = summary_request or (
         "You've reached the maximum number of tool-calling iterations allowed. "
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    summary_prompt_message = {"role": "user", "content": summary_request}
+    if persist_summary_request:
+        messages.append(summary_prompt_message)
+        summary_messages = messages
+    else:
+        summary_messages = [*messages, summary_prompt_message]
 
     try:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
-        for msg in messages:
+        for msg in summary_messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
@@ -2169,232 +2295,147 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        summary_extra_body = {}
-        try:
-            from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
-        except Exception:
-            _fixed_temperature_for_model = None
-            _OMIT_TEMP = None
-        _raw_summary_temp = (
-            _fixed_temperature_for_model(agent.model, agent.base_url)
-            if _fixed_temperature_for_model is not None
-            else None
+        summary_kwargs = agent._build_api_kwargs(
+            api_messages,
+            tools_for_api=[],
         )
-        _omit_summary_temperature = _raw_summary_temp is _OMIT_TEMP
-        _summary_temperature = None if _omit_summary_temperature else _raw_summary_temp
-        _is_nous = "nousresearch" in agent._base_url_lower
-        # LM Studio uses top-level `reasoning_effort` (not extra_body.reasoning).
-        # Mirror ChatCompletionsTransport.build_kwargs() so the summary path
-        # — which calls chat.completions.create() directly without going
-        # through the transport — sends the same shape the transport does.
-        _is_lmstudio_summary = (
-            (agent.provider or "").strip().lower() == "lmstudio"
-            and agent._supports_reasoning_extra_body()
-        )
-        _lm_reasoning_effort: str | None = (
-            agent._resolve_lmstudio_summary_reasoning_effort()
-            if _is_lmstudio_summary else None
-        )
-        if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
-            if agent.reasoning_config is not None:
-                summary_extra_body["reasoning"] = agent.reasoning_config
-            else:
-                summary_extra_body["reasoning"] = {
-                    "enabled": True,
-                    "effort": "medium"
-                }
-        if _is_nous:
-            from agent.portal_tags import nous_portal_tags as _portal_tags
-            summary_extra_body["tags"] = _portal_tags()
+        for tool_field in ("tools", "tool_choice", "parallel_tool_calls"):
+            summary_kwargs.pop(tool_field, None)
 
-        if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
-            _ct_sum = agent._get_transport()
-            _cnr_sum = _ct_sum.normalize_response(summary_response)
-            final_response = (_cnr_sum.content or "").strip()
-        else:
-            summary_kwargs = {
-                "model": agent.model,
-                "messages": api_messages,
-            }
-            if _summary_temperature is not None:
-                summary_kwargs["temperature"] = _summary_temperature
-            if agent.max_tokens is not None:
-                summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
-            if _lm_reasoning_effort is not None:
-                summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
-
-            # Merge the profile's canonical body even when routing is unset:
-            # profiles may always emit required metadata such as Portal tags.
-            provider_preferences = _provider_preferences_for_agent(agent)
-            profile_extra_body = {}
-            try:
-                from providers import get_provider_profile
-
-                provider_profile = get_provider_profile(agent.provider)
-                if provider_profile is not None:
-                    profile_extra_body = provider_profile.build_extra_body(
-                        session_id=getattr(agent, "session_id", None),
-                        provider_preferences=provider_preferences or None,
-                        model=agent.model,
-                        base_url=agent.base_url,
-                        reasoning_config=agent.reasoning_config,
-                    )
-            except Exception:
-                pass
-
-            if profile_extra_body:
-                summary_extra_body.update(profile_extra_body)
-            if provider_preferences and "provider" not in profile_extra_body and (
-                (agent.provider or "").strip().lower() == "openrouter"
-                or agent._is_openrouter_url()
-            ):
-                summary_extra_body["provider"] = provider_preferences
-
-            # Pareto Code router plugin — model-gated. Same shape as
-            # the main-loop emission so summary calls on
-            # openrouter/pareto-code respect the user's coding-score floor.
-            if (
-                agent.model == "openrouter/pareto-code"
-                and (
-                    (agent.provider or "").strip().lower() == "openrouter"
-                    or agent._is_openrouter_url()
-                )
-                and agent.openrouter_min_coding_score is not None
-                and agent.openrouter_min_coding_score != ""
-            ):
-                try:
-                    _ps = float(agent.openrouter_min_coding_score)
-                except (TypeError, ValueError):
-                    _ps = None
-                if _ps is not None and 0.0 <= _ps <= 1.0:
-                    summary_extra_body["plugins"] = [
-                        {"id": "pareto-router", "min_coding_score": _ps}
-                    ]
-
-            if summary_extra_body:
-                summary_kwargs["extra_body"] = summary_extra_body
-
-            if agent.api_mode == "anthropic_messages":
-                _tsum = agent._get_transport()
-                _ant_kw = _tsum.build_kwargs(
-                    model=agent.model,
-                    messages=api_messages,
-                    tools=None,
-                    max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
-                    is_oauth=agent._is_anthropic_oauth,
-                    preserve_dots=agent._anthropic_preserve_dots(),
-                    base_url=getattr(agent, "_anthropic_base_url", None),
-                )
-                _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
-                summary_response = _managed_summary_call(
-                    _ant_kw,
-                    agent._anthropic_messages_create,
-                    retry_count=0,
-                )
-                _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_summary_result.content or "").strip()
-            else:
-                summary_client = agent._ensure_primary_openai_client(
-                    reason="iteration_limit_summary"
-                )
-                summary_response = _managed_summary_call(
+        def _perform_summary_call(retry_count: int):
+            nonlocal summary_api_attempts
+            if agent.api_mode != "codex_responses":
+                return _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
-                    retry_count=0,
+                    agent._interruptible_api_call,
+                    retry_count=retry_count,
                 )
-                _summary_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_summary_result.content or "").strip()
+
+            codex_kwargs = agent._get_transport().preflight_kwargs(
+                dict(summary_kwargs),
+                allow_stream=False,
+                is_github_responses=agent._is_copilot_url(),
+                sanitize_harmony_tokens=agent._is_codex_backend(),
+            )
+            previous_request_id = getattr(agent, "_current_api_request_id", None)
+            previous_stream_delta = agent.stream_delta_callback
+            previous_stream_callback = agent._stream_callback
+            previous_reasoning_callback = agent.reasoning_callback
+            summary_api_attempts += 1
+            try:
+                # Codex Responses is internally stream-only. Buffer this forced
+                # final response so credential redaction and transcript
+                # sanitization run before any user-facing delivery.
+                agent._current_api_request_id = summary_api_request_id
+                agent.stream_delta_callback = None
+                agent._stream_callback = None
+                agent.reasoning_callback = None
+                return agent._run_codex_stream(codex_kwargs)
+            finally:
+                agent._current_api_request_id = previous_request_id
+                agent.stream_delta_callback = previous_stream_delta
+                agent._stream_callback = previous_stream_callback
+                agent.reasoning_callback = previous_reasoning_callback
+
+        def _normalize_summary_response(summary_response):
+            transport = agent._get_transport()
+            if agent.api_mode == "anthropic_messages":
+                return transport.normalize_response(
+                    summary_response,
+                    strip_tool_prefix=agent._is_anthropic_oauth,
+                )
+            return transport.normalize_response(summary_response)
+
+        summary_response = _perform_summary_call(0)
+        _record_final_summary_usage(agent, summary_response)
+        normalized_summary = _normalize_summary_response(summary_response)
+        assistant_record = build_assistant_message(
+            agent,
+            normalized_summary,
+            normalized_summary.finish_reason,
+        )
+        final_response = (assistant_record.get("content") or "").strip()
+
+        if not final_response and retry_empty:
+            summary_response = _perform_summary_call(1)
+            _record_final_summary_usage(agent, summary_response)
+            normalized_summary = _normalize_summary_response(summary_response)
+            assistant_record = build_assistant_message(
+                agent,
+                normalized_summary,
+                normalized_summary.finish_reason,
+            )
+            final_response = (assistant_record.get("content") or "").strip()
 
         if final_response:
-            if "<think>" in final_response:
-                final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-            if final_response:
-                summary_call_outcome = "success"
-                messages.append({"role": "assistant", "content": final_response})
-            else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+            summary_call_outcome = "success"
+            assistant_record["content"] = final_response
+            messages.append(assistant_record)
         else:
-            # Retry summary generation
-            if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
-                _ct_retry = agent._get_transport()
-                _cnr_retry = _ct_retry.normalize_response(retry_response)
-                final_response = (_cnr_retry.content or "").strip()
-            elif agent.api_mode == "anthropic_messages":
-                _tretry = agent._get_transport()
-                _ant_kw2 = _tretry.build_kwargs(
-                    model=agent.model,
-                    messages=api_messages,
-                    tools=None,
-                    is_oauth=agent._is_anthropic_oauth,
-                    max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
-                    preserve_dots=agent._anthropic_preserve_dots(),
-                    base_url=getattr(agent, "_anthropic_base_url", None),
-                )
-                _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
-                retry_response = _managed_summary_call(
-                    _ant_kw2,
-                    agent._anthropic_messages_create,
-                    retry_count=1,
-                )
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
-                final_response = (_retry_result.content or "").strip()
-            else:
-                summary_kwargs = {
-                    "model": agent.model,
-                    "messages": api_messages,
-                }
-                if _summary_temperature is not None:
-                    summary_kwargs["temperature"] = _summary_temperature
-                if agent.max_tokens is not None:
-                    summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
-                if _lm_reasoning_effort is not None:
-                    summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
-                if summary_extra_body:
-                    summary_kwargs["extra_body"] = summary_extra_body
-
-                summary_client = agent._ensure_primary_openai_client(
-                    reason="iteration_limit_summary_retry"
-                )
-                summary_response = _managed_summary_call(
-                    summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
-                    retry_count=1,
-                )
-                _retry_result = agent._get_transport().normalize_response(summary_response)
-                final_response = (_retry_result.content or "").strip()
-
-            if final_response:
-                if "<think>" in final_response:
-                    final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-                if final_response:
-                    summary_call_outcome = "success"
-                    messages.append({"role": "assistant", "content": final_response})
-                else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
-            else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+            final_response = failure_response
 
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = (
+            failure_response
+            if custom_failure_response
+            else (
+                f"I reached the maximum iterations ({agent.max_iterations}) "
+                f"but couldn't summarize. Error: {str(e)}"
+            )
+        )
     finally:
         from agent import relay_llm
 
-        relay_llm.complete_logical_call(
-            summary_api_request_id,
-            outcome=summary_call_outcome,
-        )
+        if agent.api_mode != "codex_responses":
+            relay_llm.complete_logical_call(
+                summary_api_request_id,
+                outcome=summary_call_outcome,
+            )
 
-    return final_response
+    return FinalSummaryResult(
+        final_response,
+        summary_api_attempts,
+        False,
+    )
 
+
+def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+    """Request a tool-free summary after the normal iteration budget is spent."""
+    return handle_max_iterations_result(agent, messages, api_call_count).text
+
+
+def handle_max_iterations_result(
+    agent,
+    messages: list,
+    api_call_count: int,
+) -> FinalSummaryResult:
+    """Return text plus accounting metadata for iteration-limit synthesis."""
+    return _request_final_summary(agent, messages, api_call_count)
+
+
+def handle_terminal_cap_summary(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    summary_request: str,
+    failure_response: str,
+    status_message: str,
+) -> FinalSummaryResult:
+    """Request one tool-free final response after a terminal tool-loop cap."""
+    return _request_final_summary(
+        agent,
+        messages,
+        api_call_count,
+        summary_request=summary_request,
+        failure_response=failure_response,
+        call_role="guardrail_summary",
+        request_id_prefix="guardrail-summary",
+        status_message=status_message,
+        retry_empty=False,
+        persist_summary_request=False,
+    )
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:
