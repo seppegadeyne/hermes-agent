@@ -2956,6 +2956,9 @@ delegation:
   #   extra_body:                           # Merged into the request's extra_body — e.g. OpenRouter routing hints:
   #     provider:
   #       sort: throughput
+  allow_model_selection: false              # Opt in to model-facing tasks[].model pins (off = fields hidden, pins refused)
+  allowed_models: []                        # Exact models a task may pin on the batch/parent provider (used only when enabled)
+  allowed_routes: []                        # Exact {provider, model} pairs a task may pin on another provider (used only when enabled)
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
@@ -2964,6 +2967,8 @@ delegation:
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+**Per-task model selection:** Set `delegation.allow_model_selection: true` and list exact models in `allowed_models` to expose `model` on each `tasks[]` item, as an enum of those values. The child stays on the batch/parent provider and credentials. To allow another provider, list the exact pair under `allowed_routes`. The fields are hidden while disabled, and a value outside the lists fails the whole call before any child is spawned. See [Subagent Delegation](features/delegation.md#opt-in-per-task-model-selection).
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
 

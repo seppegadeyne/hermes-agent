@@ -289,7 +289,20 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Each `tasks[]` entry may set optional `provider` and/or `model` to pin that child only (same resolution path as CLI/config, including custom `providers:` table names). Tasks that omit both inherit the batch/parent route or the global `delegation.*` pin. A leftover global `delegation.base_url` is not applied to a child that pins a different provider. An unknown provider fails the spawn instead of silently inheriting.
+### Opt-in per-task model selection
+
+The global pin covers one model for every child. To let the parent route *some* tasks in a batch differently — a cheap tier for mechanical extraction while judgement stays on the stronger model — enable selection and list the exact models the operator allows:
+
+```yaml
+delegation:
+  allow_model_selection: true
+  allowed_models: [haiku, sonnet]           # exact names, on the batch/parent provider and its credentials
+  allowed_routes:                           # optional: another provider, only as an exact provider/model pair
+    - provider: openrouter
+      model: google/gemini-3-flash-preview
+```
+
+Each `tasks[]` entry may then set `model` (from `allowed_models`), or `provider` + `model` as one of the `allowed_routes` pairs. The feature is off by default: while `allow_model_selection` is false or both lists are empty, the fields are not advertised and any pin is refused, so the default contract is unchanged — children inherit the parent route or the global `delegation.*` pin. When enabled, the model only sees the listed values as enums, and a value outside the lists (`model 'x' is not allowed`, `route 'p:m' is not allowed`) refuses the whole call before any child is built. A model from `allowed_models` keeps the child on the batch/parent provider and its credentials, so a same-provider tier needs no extra setup; it is never combined with another provider. Route pins resolve through the same path as `delegation.provider` (including custom `providers:` table names); a leftover global `delegation.base_url` is not applied to a child that pins a different provider, and an unknown provider fails the spawn instead of silently inheriting. Start a new session after changing these settings so the tool schema reflects them.
 
 ## The `/review` Command
 
@@ -637,6 +650,9 @@ delegation:
   max_iterations: 250                       # Max turns per child (default: 250)
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
   # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
+  # allow_model_selection: false            # Opt in to tasks[].model pins (see Opt-in per-task model selection above)
+  # allowed_models: []                      # Exact models a task may pin on the batch/parent provider, e.g. [haiku, sonnet]
+  # allowed_routes: []                      # Exact {provider, model} pairs a task may pin on another provider
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.

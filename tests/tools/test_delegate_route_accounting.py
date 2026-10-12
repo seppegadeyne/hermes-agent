@@ -15,6 +15,13 @@ from tests.tools.test_delegate_task_provider_pin import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _model_selection_gate_open(monkeypatch):
+    """These tests cover pin resolution; the operator opt-in gate has its own tests
+    (test_delegate_model_allowlist.py)."""
+    monkeypatch.setattr("tools.delegate_tool.check_task_selection", lambda task, models, routes: None)
+
+
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("invalid", ["provider", "model", "default"])
 def test_failed_route_does_not_spend_oneshot_budget(background, invalid):

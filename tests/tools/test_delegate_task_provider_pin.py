@@ -15,6 +15,13 @@ import tools.delegate_tool as delegate_module
 from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
 
 
+@pytest.fixture(autouse=True)
+def _model_selection_gate_open(monkeypatch):
+    """These tests cover pin resolution; the operator opt-in gate has its own tests
+    (test_delegate_model_allowlist.py)."""
+    monkeypatch.setattr("tools.delegate_tool.check_task_selection", lambda task, models, routes: None)
+
+
 PARENT_CREDS = {
     "provider": "nous",
     "model": "muse-glimmer",

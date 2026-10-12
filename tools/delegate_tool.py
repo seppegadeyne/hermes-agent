@@ -37,6 +37,9 @@ from tools.delegate_tool_config import (
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _child_route_metadata, _run_batch
+from tools.delegate_tool_model_selection import (
+    check_task_selection, model_selection_schema, refuse_unselected_task_pins,
+)
 from tools.delegate_tool_progress import (
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
@@ -437,6 +440,24 @@ def _resolve_task_credentials(
     return _resolve_delegation_credentials(overlay, parent_agent), overlay
 
 
+def _preflight_task_routes(task_list, cfg, routing_cfg, parent_agent) -> tuple[Optional[dict], list, Optional[str]]:
+    """Every route the batch will use, resolved before any child is allocated: ``(default_creds, routes, err)``.
+    Per-task pins are operator opt-in (delegation.allow_model_selection), so an unlisted pin refuses the call first."""
+    err = refuse_unselected_task_pins(task_list, cfg)
+    if err:
+        return None, [], err
+    default_creds = None
+    if any(not _task_has_route_pin(task) for task in task_list):
+        try:
+            default_creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        except ValueError as exc:
+            # An unpinned task genuinely inherits this route, so its failure
+            # must reject the complete batch before any child is allocated.
+            return None, [], str(exc)
+    resolved_routes, err = _resolve_task_routes(task_list, default_creds, routing_cfg, parent_agent)
+    return default_creds, resolved_routes, err
+
+
 def _task_has_route_pin(task: dict[str, Any]) -> bool:
     return bool(_task_route_pin(task.get("provider")) or _task_route_pin(task.get("model")))
 
@@ -600,16 +621,7 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
-    default_creds = None
-    if any(not _task_has_route_pin(task) for task in task_list):
-        try:
-            default_creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
-        except ValueError as exc:
-            # An unpinned task genuinely inherits this route, so its failure
-            # must reject the complete batch before any child is allocated.
-            return tool_error(str(exc))
-
-    resolved_routes, err = _resolve_task_routes(task_list, default_creds, routing_cfg, parent_agent)
+    default_creds, resolved_routes, err = _preflight_task_routes(task_list, cfg, routing_cfg, parent_agent)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -732,8 +744,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless a task sets provider/model, or via "
-    "delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml, "
+    "or per task to a model the operator allowed (delegation.allow_model_selection)."
 )
 
 def _build_tasks_param_description() -> str:
@@ -765,6 +777,9 @@ def _build_dynamic_schema_overrides() -> dict:
         tasks["items"] = {**tasks["items"], "properties": {
             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
         }}
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["items"] = {**tasks["items"], "properties": model_selection_schema(
+        tasks["items"]["properties"], _load_config())}
 
     return {
         "description": _build_top_level_description(independent_completions=independent_completions),
